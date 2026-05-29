@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"hi-silver-desktop/app/session"
 	"hi-silver-desktop/app/webrtc"
 	"log"
@@ -14,15 +15,24 @@ type App struct {
 	client     *firestore.Client
 	listener   *session.Listener
 	rtcManager *webrtc.StreamManager
-	mu         sync.Mutex // To prevent race conditions on stream state
+	mu         sync.Mutex
 }
 
-func NewApp(client *firestore.Client) *App {
+func NewApp(client *firestore.Client) (*App, error) {
+	rtc, err := webrtc.NewStreamManager()
+	if err != nil {
+		return nil, fmt.Errorf("stream manager init: %w", err)
+	}
 	return &App{
 		client:     client,
 		listener:   session.NewListener(client, "sessions"),
-		rtcManager: &webrtc.StreamManager{},
-	}
+		rtcManager: rtc,
+	}, nil
+}
+
+// RtcManager exposes the StreamManager for use by the preview server and main.
+func (a *App) RtcManager() *webrtc.StreamManager {
+	return a.rtcManager
 }
 
 // Run starts the main control loop

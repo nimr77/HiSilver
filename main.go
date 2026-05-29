@@ -2,10 +2,17 @@ package main
 
 import (
 	"context"
-	"fmt"
-	firebaseApp "hi-silver-desktop/firebase"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"hi-silver-desktop/app"
+	appwebrtc "hi-silver-desktop/app/webrtc"
+	firebaseApp "hi-silver-desktop/firebase"
 )
+
+const previewAddr = "localhost:8081"
 
 func main() {
 	_, err := firebaseApp.InitializeApp()
@@ -13,11 +20,38 @@ func main() {
 		log.Fatalf("Failed to initialize Firebase app: %v", err)
 	}
 
-	err = firebaseApp.InitDB(context.Background())
-	if err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err = firebaseApp.InitDB(ctx); err != nil {
 		log.Fatalf("Failed to initialize Firestore DB: %v", err)
 	}
 
-	fmt.Println("🐱 HiSilver Desktop is active. Waiting for Silver's human...")
+	// ── Build the main application (also captures camera + mic) ──────────────
+	a, err := app.NewApp(firebaseApp.DB)
+	if err != nil {
+		log.Fatalf("Failed to create app: %v", err)
+	}
 
+	// ── Local browser preview (http://localhost:8081) ─────────────────────────
+	preview := appwebrtc.NewPreviewServer(a.RtcManager())
+	go func() {
+		if err := preview.Start(previewAddr); err != nil {
+			log.Printf("⚠️  Preview server stopped: %v", err)
+		}
+	}()
+
+	// ── Start watching Firestore for mobile commands ──────────────────────────
+	a.Run(ctx)
+
+	log.Println("🐱 HiSilver Desktop is active. Open http://" + previewAddr + " to preview the camera.")
+
+	// ── Block until SIGINT / SIGTERM ──────────────────────────────────────────
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("👋 Shutting down...")
+	cancel()
+	a.RtcManager().StopAll()
 }

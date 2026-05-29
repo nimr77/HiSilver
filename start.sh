@@ -1,5 +1,38 @@
 #!/bin/bash
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Dependency check — must run pre_required_tools.sh first if anything is missing
+# ─────────────────────────────────────────────────────────────────────────────
+check_prerequisites() {
+    local MISSING=()
+
+    if ! command -v pkg-config &>/dev/null; then
+        MISSING+=("pkg-config")
+    fi
+
+    if ! pkg-config --exists vpx 2>/dev/null; then
+        MISSING+=("libvpx")
+    fi
+
+    if ! pkg-config --exists opus 2>/dev/null; then
+        MISSING+=("libopus / opus")
+    fi
+
+    if [[ ${#MISSING[@]} -gt 0 ]]; then
+        echo ""
+        echo "❌ Missing required libraries: ${MISSING[*]}"
+        echo ""
+        echo "   Run the installer first:"
+        echo "   bash pre_required_tools.sh"
+        echo ""
+        exit 1
+    fi
+
+    echo "✅ All prerequisites satisfied."
+}
+
+check_prerequisites
+
 # Default environment
 ENV="debug"
 
