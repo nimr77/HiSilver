@@ -92,7 +92,7 @@ func NewStreamManager() (*StreamManager, error) {
 
 // newPeerConnection creates a PeerConnection with the live camera/mic tracks pre-added.
 // It can be called multiple times to create the mobile connection AND the preview connection.
-func (s *StreamManager) newPeerConnection() (*webrtc.PeerConnection, error) {
+func (s *StreamManager) newPeerConnection(dir webrtc.RTPTransceiverDirection) (*webrtc.PeerConnection, error) {
 	cfg := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -110,7 +110,7 @@ func (s *StreamManager) newPeerConnection() (*webrtc.PeerConnection, error) {
 			log.Printf("⚠️ [SilvRTC] Media track ended: %v", err)
 		})
 		if _, err = pc.AddTransceiverFromTrack(track,
-			webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendrecv},
+			webrtc.RTPTransceiverInit{Direction: dir},
 		); err != nil {
 			_ = pc.Close()
 			return nil, fmt.Errorf("add track: %w", err)
@@ -132,7 +132,8 @@ func (s *StreamManager) StartHandshake(ctx context.Context, client *firestore.Cl
 		s.mobilePeer = nil
 	}
 
-	pc, err := s.newPeerConnection()
+	// sendrecv: desktop sends camera/mic AND receives mobile audio (talk-back)
+	pc, err := s.newPeerConnection(webrtc.RTPTransceiverDirectionSendrecv)
 	if err != nil {
 		return err
 	}
@@ -343,6 +344,7 @@ func (s *StreamManager) StopAll() {
 
 // NewPreviewPeerConnection creates a separate PeerConnection that shares the same
 // live camera/mic source — used by the local browser preview server.
+// Uses sendonly: the browser only needs to receive, not send.
 func (s *StreamManager) NewPreviewPeerConnection() (*webrtc.PeerConnection, error) {
-	return s.newPeerConnection()
+	return s.newPeerConnection(webrtc.RTPTransceiverDirectionSendonly)
 }
