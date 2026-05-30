@@ -2,6 +2,7 @@ package webrtc
 
 import (
 	_ "embed"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,7 +10,9 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
+	"cloud.google.com/go/firestore"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -28,14 +31,18 @@ type previewSession struct {
 // connection) so the two streams are completely independent.
 type PreviewServer struct {
 	manager  *StreamManager
+	client   *firestore.Client // Firestore client for simulator endpoints
+	ctx      context.Context   // app-level context for Firestore ops
 	mu       sync.Mutex
 	sessions map[string]*previewSession
 }
 
 // NewPreviewServer creates a PreviewServer backed by the given StreamManager.
-func NewPreviewServer(manager *StreamManager) *PreviewServer {
+func NewPreviewServer(manager *StreamManager, client *firestore.Client, ctx context.Context) *PreviewServer {
 	return &PreviewServer{
 		manager:  manager,
+		client:   client,
+		ctx:      ctx,
 		sessions: make(map[string]*previewSession),
 	}
 }
@@ -44,7 +51,13 @@ func NewPreviewServer(manager *StreamManager) *PreviewServer {
 func (ps *PreviewServer) Start(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", ps.handleIndex)
+	// ── Simulator: mobile-side commands + Firestore-based WebRTC signaling ──
 	mux.HandleFunc("/session/cmd", ps.handleSessionCmd)
+	mux.HandleFunc("/session/offer", ps.handleSessionOffer)
+	mux.HandleFunc("/session/answer", ps.handleSessionAnswer)
+	mux.HandleFunc("/session/mobile-candidate", ps.handleMobileCandidate)
+	mux.HandleFunc("/session/desktop-candidates", ps.handleDesktopCandidates)
+	// ── Direct preview: REST-based WebRTC signaling (for raw testing) ──
 	mux.HandleFunc("/preview/offer", ps.handleOffer)
 	mux.HandleFunc("/preview/answer", ps.handleAnswer)
 	mux.HandleFunc("/preview/ice-candidate", ps.handleBrowserCandidate)
@@ -140,8 +153,8 @@ func (ps *PreviewServer) handleOffer(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleSessionCmd simulates mobile app commands so the browser can run the
-// full start → active → close scenario without a real Android device.
+// handleSessionCmd writes commands to Firestore exactly as a real mobile app would,
+// so every action from the browser simulator is visible in the Firebase console.
 func (ps *PreviewServer) handleSessionCmd(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -161,48 +174,205 @@ func (ps *PreviewServer) handleSessionCmd(w http.ResponseWriter, r *http.Request
 
 	switch body.Command {
 	case "start":
-		sid := fmt.Sprintf("%d", rand.Int63())
-		log.Printf("📱 [Simulator] start — new session %s", sid)
-		_ = json.NewEncoder(w).Encode(map[string]string{"sessionId": sid})
+		// Create a brand-new session document — just like the mobile app would
+		ref, _, err := ps.client.Collection("sessions").Add(r.Context(), map[string]interface{}{
+			"command":   "start",
+			"createdAt": firestore.ServerTimestamp,
+			"status":    "pending",
+		})
+		if err != nil {
+			http.Error(w, "Firestore write failed: "+err.Error(), http.StatusInternalServerError)
+			log.Printf("❌ [Simulator] start: %v", err)
+			return
+		}
+		log.Printf("📱 [Simulator] start — created Firestore doc sessions/%s", ref.ID)
+		_ = json.NewEncoder(w).Encode(map[string]string{"sessionId": ref.ID})
 		return
 
 	case "active":
-		log.Printf("📱 [Simulator] active — opening camera and streaming to browser")
-		ps.closeAllSessions() // drop any stale preview connection
-		offer, sid, err := ps.createOffer()
+		if body.SessionID == "" {
+			http.Error(w, "missing sessionId", http.StatusBadRequest)
+			return
+		}
+		_, err := ps.client.Collection("sessions").Doc(body.SessionID).Update(r.Context(), []firestore.Update{
+			{Path: "command", Value: "active"},
+		})
 		if err != nil {
-			http.Error(w, "stream setup failed: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Firestore update failed: "+err.Error(), http.StatusInternalServerError)
 			log.Printf("❌ [Simulator] active: %v", err)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"offer":     offer,
-			"sessionId": sid,
-		})
+		log.Printf("📱 [Simulator] active — updated sessions/%s", body.SessionID)
+		_ = json.NewEncoder(w).Encode(map[string]string{"sessionId": body.SessionID})
 		return
 
 	case "close":
-		log.Printf("📱 [Simulator] close — stopping camera and all connections")
+		if body.SessionID != "" {
+			_, _ = ps.client.Collection("sessions").Doc(body.SessionID).Update(r.Context(), []firestore.Update{
+				{Path: "command", Value: "close"},
+			})
+		}
+		log.Printf("📱 [Simulator] close — sessions/%s", body.SessionID)
 		ps.closeAllSessions()
 		ps.manager.StopAll()
 		_ = json.NewEncoder(w).Encode(map[string]string{"ok": "1"})
 		return
 	}
 
+	// Sub-commands — write to Firestore so the app listener can process them
+	if body.SessionID == "" {
+		http.Error(w, "missing sessionId for subCommand", http.StatusBadRequest)
+		return
+	}
 	switch body.SubCommand {
-	case "startRecord":
-		log.Printf("📱 [Simulator] startRecord")
-		ps.manager.ToggleRecording(true)
-	case "stopRecord":
-		log.Printf("📱 [Simulator] stopRecord")
-		ps.manager.ToggleRecording(false)
-	case "downloadRecord":
-		log.Printf("📱 [Simulator] downloadRecord — TODO: upload to Firebase Storage")
+	case "startRecord", "stopRecord", "downloadRecord":
+		_, err := ps.client.Collection("sessions").Doc(body.SessionID).Update(r.Context(), []firestore.Update{
+			{Path: "subCommand", Value: body.SubCommand},
+		})
+		if err != nil {
+			http.Error(w, "Firestore update failed: "+err.Error(), http.StatusInternalServerError)
+			log.Printf("❌ [Simulator] subCommand %s: %v", body.SubCommand, err)
+			return
+		}
+		log.Printf("📱 [Simulator] subCommand=%s — sessions/%s", body.SubCommand, body.SessionID)
 	default:
 		http.Error(w, "unknown command or subCommand", http.StatusBadRequest)
 		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]string{"ok": "1"})
+}
+
+// handleSessionOffer long-polls Firestore until StartHandshake writes the SDP offer,
+// then returns it to the browser. Timeout: 30 s.
+func (ps *PreviewServer) handleSessionOffer(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("sessionId")
+	if sessionID == "" {
+		http.Error(w, "missing sessionId", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	iter := ps.client.Collection("sessions").Doc(sessionID).Snapshots(ctx)
+	defer iter.Stop()
+
+	for {
+		snap, err := iter.Next()
+		if err != nil {
+			http.Error(w, "timeout or error waiting for offer: "+err.Error(), http.StatusGatewayTimeout)
+			return
+		}
+		data := snap.Data()
+		wd, ok := data["webrtc"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		offer, ok := wd["offer"].(string)
+		if !ok || offer == "" {
+			continue
+		}
+		log.Printf("📡 [Simulator] offer ready for sessions/%s — sending to browser", sessionID)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"offer": offer})
+		return
+	}
+}
+
+// handleSessionAnswer writes the browser's SDP answer to Firestore so monitorSession picks it up.
+func (ps *PreviewServer) handleSessionAnswer(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+		Answer    string `json:"answer"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if body.SessionID == "" || body.Answer == "" {
+		http.Error(w, "missing sessionId or answer", http.StatusBadRequest)
+		return
+	}
+	_, err := ps.client.Collection("sessions").Doc(body.SessionID).Update(r.Context(), []firestore.Update{
+		{Path: "webrtc.answer", Value: body.Answer},
+		{Path: "webrtc.answerType", Value: "answer"},
+	})
+	if err != nil {
+		http.Error(w, "Firestore write failed: "+err.Error(), http.StatusInternalServerError)
+		log.Printf("❌ [Simulator] answer: %v", err)
+		return
+	}
+	log.Printf("📡 [Simulator] answer written to sessions/%s", body.SessionID)
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleMobileCandidate writes a browser ICE candidate into the Firestore
+// webrtcCandidates.mobile array so the desktop's monitorSession picks it up.
+func (ps *PreviewServer) handleMobileCandidate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"sessionId"`
+		Candidate struct {
+			Candidate        string  `json:"candidate"`
+			SDPMid           *string `json:"sdpMid"`
+			SDPMLineIndex    *uint16 `json:"sdpMLineIndex"`
+		} `json:"candidate"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if body.SessionID == "" {
+		http.Error(w, "missing sessionId", http.StatusBadRequest)
+		return
+	}
+	entry := map[string]interface{}{"candidate": body.Candidate.Candidate}
+	if body.Candidate.SDPMid != nil {
+		entry["sdpMid"] = *body.Candidate.SDPMid
+	}
+	if body.Candidate.SDPMLineIndex != nil {
+		entry["sdpMLineIndex"] = *body.Candidate.SDPMLineIndex
+	}
+	_, err := ps.client.Collection("sessions").Doc(body.SessionID).Update(r.Context(), []firestore.Update{
+		{Path: "webrtcCandidates.mobile", Value: firestore.ArrayUnion(entry)},
+	})
+	if err != nil {
+		log.Printf("⚠️ [Simulator] mobile-candidate write: %v", err)
+		http.Error(w, "Firestore write failed", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleDesktopCandidates reads desktop ICE candidates from Firestore at a given offset,
+// returning any new ones since the last poll.
+func (ps *PreviewServer) handleDesktopCandidates(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("sessionId")
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	if sessionID == "" {
+		http.Error(w, "missing sessionId", http.StatusBadRequest)
+		return
+	}
+
+	snap, err := ps.client.Collection("sessions").Doc(sessionID).Get(r.Context())
+	if err != nil {
+		http.Error(w, "Firestore read failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := snap.Data()
+
+	var slice []map[string]interface{}
+	if cd, ok := data["webrtcCandidates"].(map[string]interface{}); ok {
+		if desktop, ok := cd["desktop"].([]interface{}); ok {
+			for i := offset; i < len(desktop); i++ {
+				if c, ok := desktop[i].(map[string]interface{}); ok {
+					slice = append(slice, c)
+				}
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"candidates": slice})
 }
 
 // handleAnswer receives the browser's SDP answer and applies it to the PeerConnection.

@@ -34,7 +34,7 @@ func main() {
 	}
 
 	// ── Local browser preview (http://localhost:8081) ─────────────────────────
-	preview := appwebrtc.NewPreviewServer(a.RtcManager())
+	preview := appwebrtc.NewPreviewServer(a.RtcManager(), firebaseApp.DB, ctx)
 	go func() {
 		if err := preview.Start(previewAddr); err != nil {
 			log.Printf("⚠️  Preview server stopped: %v", err)
