@@ -11,9 +11,9 @@ import (
 type Command string
 
 const (
-	CmdOpen    Command = "open"
-	CmdClose   Command = "close"
 	CmdStart   Command = "start"
+	CmdActive  Command = "active"
+	CmdClose   Command = "close"
 	CmdUnknown Command = "unknown"
 )
 

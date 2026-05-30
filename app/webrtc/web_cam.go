@@ -70,24 +70,45 @@ func NewStreamManager() (*StreamManager, error) {
 	}
 	reg.Add(factory)
 
-	// ── 4. Capture camera + microphone ────────────────────────────────────────
-	stream, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
-		Video: func(c *mediadevices.MediaTrackConstraints) {},
-		Audio: func(c *mediadevices.MediaTrackConstraints) {},
-		Codec: codecSelector,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to access camera/microphone (ensure permissions and that libvpx/libopus are installed): %w", err)
-	}
-
-	log.Printf("📷 [SilvRTC] Camera and microphone ready. Tracks: %d", len(stream.GetTracks()))
+	log.Println("⚙️ [SilvRTC] WebRTC engine ready. Camera will open when a session starts.")
 
 	return &StreamManager{
 		api:            webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(reg)),
 		codecSelector:  codecSelector,
-		mediaStream:    stream,
 		recInterceptor: recInter,
 	}, nil
+}
+
+// openMedia opens the camera and microphone if not already open.
+// Must be called with s.mu held.
+func (s *StreamManager) openMedia() error {
+	if s.mediaStream != nil {
+		return nil // already open — reuse existing tracks
+	}
+	// Video only — no audio sent to mobile or browser (by design)
+	stream, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
+		Video: func(c *mediadevices.MediaTrackConstraints) {},
+		Codec: s.codecSelector,
+	})
+	if err != nil {
+		return fmt.Errorf("camera/microphone unavailable (check permissions and libvpx/libopus): %w", err)
+	}
+	s.mediaStream = stream
+	log.Printf("📷 [SilvRTC] Camera and microphone opened. Tracks: %d", len(stream.GetTracks()))
+	return nil
+}
+
+// closeMedia stops all media tracks and releases hardware.
+// Must be called with s.mu held.
+func (s *StreamManager) closeMedia() {
+	if s.mediaStream == nil {
+		return
+	}
+	for _, t := range s.mediaStream.GetTracks() {
+		t.Close()
+	}
+	s.mediaStream = nil
+	log.Println("📷 [SilvRTC] Camera released. Hardware light should be OFF.")
 }
 
 // newPeerConnection creates a PeerConnection with the live camera/mic tracks pre-added.
@@ -128,8 +149,15 @@ func (s *StreamManager) StartHandshake(ctx context.Context, client *firestore.Cl
 
 	// Close any stale connection from a previous session
 	if s.mobilePeer != nil {
+		log.Printf("⚠️  [SilvRTC] [%s] Closing stale peer connection from previous session", sessionID)
 		_ = s.mobilePeer.Close()
 		s.mobilePeer = nil
+	}
+
+	// Open camera/mic now — this is the moment the session starts
+	log.Printf("📷 [SilvRTC] [%s] Opening camera and microphone...", sessionID)
+	if err := s.openMedia(); err != nil {
+		return err
 	}
 
 	// sendrecv: desktop sends camera/mic AND receives mobile audio (talk-back)
@@ -141,21 +169,30 @@ func (s *StreamManager) StartHandshake(ctx context.Context, client *firestore.Cl
 
 	// ── Receive audio from mobile (talk-back) ────────────────────────────────
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		log.Printf("🔊 [SilvRTC] Remote track from Android: %s (SSRC %d)", track.Codec().MimeType, track.SSRC())
+		log.Printf("🔊 [SilvRTC] [%s] Remote track received from Android: %s (SSRC %d)", sessionID, track.Codec().MimeType, track.SSRC())
 		go drainRemoteTrack(track)
 	})
 
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
-		log.Printf("🔗 [SilvRTC] Mobile connection: %s", st)
+		log.Printf("🔗 [SilvRTC] [%s] Mobile connection state → %s", sessionID, st)
+	})
+
+	pc.OnICEConnectionStateChange(func(st webrtc.ICEConnectionState) {
+		log.Printf("🧊 [SilvRTC] [%s] ICE connection state → %s", sessionID, st)
+	})
+
+	pc.OnICEGatheringStateChange(func(st webrtc.ICEGatheringState) {
+		log.Printf("🧊 [SilvRTC] [%s] ICE gathering state → %s", sessionID, st)
 	})
 
 	// ── Trickle ICE: send candidates to Firestore as they arrive ─────────────
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
-			return // gathering complete
+			log.Printf("🧊 [SilvRTC] [%s] ICE gathering complete", sessionID)
+			return
 		}
 		cj := c.ToJSON()
-		log.Printf("🧊 [SilvRTC] ICE candidate → Firestore: %s", cj.Candidate)
+		log.Printf("🧊 [SilvRTC] [%s] Desktop ICE candidate → Firestore: %s", sessionID, cj.Candidate)
 		if _, uerr := client.Collection("sessions").Doc(sessionID).Update(ctx, []firestore.Update{
 			{
 				Path: "webrtcCandidates.desktop",
@@ -166,7 +203,7 @@ func (s *StreamManager) StartHandshake(ctx context.Context, client *firestore.Cl
 				}),
 			},
 		}); uerr != nil {
-			log.Printf("❌ [SilvRTC] Failed to push ICE candidate: %v", uerr)
+			log.Printf("❌ [SilvRTC] [%s] Failed to push ICE candidate: %v", sessionID, uerr)
 		}
 	})
 
@@ -187,7 +224,7 @@ func (s *StreamManager) StartHandshake(ctx context.Context, client *firestore.Cl
 		return fmt.Errorf("failed to publish offer to Firestore: %w", err)
 	}
 
-	log.Printf("📡 [SilvRTC] Offer sent to sessions/%s — waiting for Android answer...", sessionID)
+	log.Printf("📡 [SilvRTC] [%s] Offer written to Firestore (sessions/%s) — waiting for Android answer...", sessionID, sessionID)
 
 	go s.monitorSession(ctx, client, sessionID)
 	return nil
@@ -196,6 +233,8 @@ func (s *StreamManager) StartHandshake(ctx context.Context, client *firestore.Cl
 // monitorSession watches the Firestore session document for the Android answer
 // and any incoming ICE candidates, applying them as they arrive.
 func (s *StreamManager) monitorSession(ctx context.Context, client *firestore.Client, sessionID string) {
+	log.Printf("👁  [SilvRTC] [%s] Watching Firestore for answer and mobile ICE candidates...", sessionID)
+
 	snapshots := client.Collection("sessions").Doc(sessionID).Snapshots(ctx)
 	defer snapshots.Stop()
 
@@ -205,16 +244,34 @@ func (s *StreamManager) monitorSession(ctx context.Context, client *firestore.Cl
 	for {
 		snap, err := snapshots.Next()
 		if err != nil {
-			log.Printf("❌ [SilvRTC] Session monitor error: %v", err)
+			log.Printf("❌ [SilvRTC] [%s] Session monitor stopped: %v", sessionID, err)
 			return
 		}
 		data := snap.Data()
+
+		// ── Log snapshot summary ─────────────────────────────────────────────
+		hasAnswer := false
+		mobileCandCount := 0
+		if wd, ok := data["webrtc"].(map[string]interface{}); ok {
+			if a, ok := wd["answer"].(string); ok && a != "" {
+				hasAnswer = true
+			}
+		}
+		if cd, ok := data["webrtcCandidates"].(map[string]interface{}); ok {
+			if m, ok := cd["mobile"].([]interface{}); ok {
+				mobileCandCount = len(m)
+			}
+		}
+		statusStr, _ := data["status"].(string)
+		log.Printf("🔄 [SilvRTC] [%s] Firestore update — status: %q | answer: %v | mobile ICE: %d (applied: %d)",
+			sessionID, statusStr, hasAnswer, mobileCandCount, appliedCandidates)
 
 		s.mu.Lock()
 		pc := s.mobilePeer
 		s.mu.Unlock()
 
 		if pc == nil {
+			log.Printf("⚠️  [SilvRTC] [%s] PeerConnection gone, stopping monitor", sessionID)
 			return
 		}
 
@@ -222,14 +279,15 @@ func (s *StreamManager) monitorSession(ctx context.Context, client *firestore.Cl
 		if !answerApplied {
 			if webrtcData, ok := data["webrtc"].(map[string]interface{}); ok {
 				if sdp, ok := webrtcData["answer"].(string); ok && sdp != "" {
-					log.Println("✅ [SilvRTC] Answer received — finalising connection...")
+					log.Printf("✅ [SilvRTC] [%s] Android answer received — applying remote description...", sessionID)
 					if err = pc.SetRemoteDescription(webrtc.SessionDescription{
 						Type: webrtc.SDPTypeAnswer,
 						SDP:  sdp,
 					}); err != nil {
-						log.Printf("❌ [SilvRTC] SetRemoteDescription: %v", err)
+						log.Printf("❌ [SilvRTC] [%s] SetRemoteDescription failed: %v", sessionID, err)
 					} else {
 						answerApplied = true
+						log.Printf("✅ [SilvRTC] [%s] Remote description set — ICE negotiation in progress", sessionID)
 					}
 				}
 			}
@@ -238,6 +296,10 @@ func (s *StreamManager) monitorSession(ctx context.Context, client *firestore.Cl
 		// ── Apply incoming ICE candidates from Android ───────────────────────
 		if candidates, ok := data["webrtcCandidates"].(map[string]interface{}); ok {
 			if mobile, ok := candidates["mobile"].([]interface{}); ok {
+				newCount := len(mobile) - appliedCandidates
+				if newCount > 0 {
+					log.Printf("🧊 [SilvRTC] [%s] Applying %d new mobile ICE candidate(s)...", sessionID, newCount)
+				}
 				for i := appliedCandidates; i < len(mobile); i++ {
 					cMap, ok := mobile[i].(map[string]interface{})
 					if !ok {
@@ -253,8 +315,9 @@ func (s *StreamManager) monitorSession(ctx context.Context, client *firestore.Cl
 						v := uint16(idx)
 						init.SDPMLineIndex = &v
 					}
+					log.Printf("🧊 [SilvRTC] [%s] Mobile ICE candidate [%d]: %s", sessionID, i, cMap["candidate"])
 					if aerr := pc.AddICECandidate(init); aerr != nil {
-						log.Printf("⚠️ [SilvRTC] AddICECandidate: %v", aerr)
+						log.Printf("⚠️  [SilvRTC] [%s] AddICECandidate[%d] failed: %v", sessionID, i, aerr)
 					}
 				}
 				appliedCandidates = len(mobile)
@@ -333,18 +396,19 @@ func (s *StreamManager) StopAll() {
 		s.mobilePeer = nil
 	}
 
-	if s.mediaStream != nil {
-		for _, t := range s.mediaStream.GetTracks() {
-			t.Close()
-		}
-	}
-
-	log.Println("✅ [SilvRTC] Hardware released. Camera light should be OFF.")
+	s.closeMedia()
 }
 
 // NewPreviewPeerConnection creates a separate PeerConnection that shares the same
 // live camera/mic source — used by the local browser preview server.
 // Uses sendonly: the browser only needs to receive, not send.
+// Opens the camera/mic if not already open (e.g. when no Firebase session is active yet).
 func (s *StreamManager) NewPreviewPeerConnection() (*webrtc.PeerConnection, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.openMedia(); err != nil {
+		return nil, err
+	}
 	return s.newPeerConnection(webrtc.RTPTransceiverDirectionSendonly)
 }

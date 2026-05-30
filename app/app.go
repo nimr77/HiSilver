@@ -45,19 +45,18 @@ func (a *App) Run(ctx context.Context) {
 
 		// 1. Handle Primary Commands
 		switch cmd {
-		case session.CmdOpen:
-			log.Printf("📂 [%s] Session initialized. Waiting for 'start'...", sessionID)
-
 		case session.CmdStart:
-			log.Printf("🎥 [%s] Starting WebRTC Stream for Silver.", sessionID)
-			// Pass the client and sessionID so WebRTC can write the Offer back to Firestore
+			log.Printf("📶 [%s] Session start — desktop is ready, waiting for 'active'...", sessionID)
+
+		case session.CmdActive:
+			log.Printf("📹 [%s] Active — opening camera and starting WebRTC stream.", sessionID)
 			err := a.rtcManager.StartHandshake(ctx, a.client, sessionID)
 			if err != nil {
 				log.Printf("❌ [%s] WebRTC Start Error: %v", sessionID, err)
 			}
 
 		case session.CmdClose:
-			log.Printf("🛑 [%s] Closing session and cleaning hardware.", sessionID)
+			log.Printf("🛑 [%s] Close — shutting down camera and connection.", sessionID)
 			a.rtcManager.StopAll()
 		}
 

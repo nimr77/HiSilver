@@ -3,7 +3,364 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>HiSilver — Desktop Preview</title>
+    <title>HiSilver — Mobile Simulator</title>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+      body {
+        background: #0d0d0d;
+        color: #e0e0e0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        min-height: 100vh;
+        padding: 24px 16px;
+        gap: 14px;
+      }
+
+      h1 { font-size: 1.35rem; color: #ff9f43; letter-spacing: 0.5px; }
+      h1 span { opacity: 0.45; font-size: 0.9rem; }
+
+      /* ── Cards ──────────────────────────────────────────────── */
+      .card {
+        width: 100%;
+        max-width: 800px;
+        background: #161616;
+        border-radius: 12px;
+        border: 1px solid #272727;
+        padding: 16px 18px;
+      }
+      .card-label {
+        font-size: 0.68rem;
+        text-transform: uppercase;
+        letter-spacing: 1.4px;
+        color: #4a4a4a;
+        margin-bottom: 12px;
+      }
+
+      /* ── Session state indicator ────────────────────────────── */
+      .state-row {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        margin-bottom: 14px;
+      }
+      .dot {
+        width: 9px; height: 9px;
+        border-radius: 50%;
+        background: #3a3a3a;
+        flex-shrink: 0;
+        transition: background 0.25s;
+      }
+      .dot.started   { background: #f7c843; animation: blink 1.2s infinite; }
+      .dot.streaming { background: #26de81; }
+      .dot.recording { background: #fc5c65; animation: blink 0.7s infinite; }
+      .dot.error     { background: #fc5c65; }
+      @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
+      #state-label { font-size: 0.87rem; font-weight: 600; }
+
+      /* ── Button rows ────────────────────────────────────────── */
+      .btn-row { display: flex; gap: 9px; flex-wrap: wrap; }
+      .btn-row + .btn-row { margin-top: 10px; }
+
+      button {
+        padding: 8px 16px;
+        border: none; border-radius: 6px;
+        font-size: 0.82rem; font-weight: 700;
+        cursor: pointer;
+        transition: opacity .18s, transform .1s;
+        letter-spacing: 0.2px;
+      }
+      button:disabled        { opacity: 0.3; cursor: default; }
+      button:not(:disabled):active { transform: scale(0.96); }
+
+      #btn-start    { background: #26de81; color: #000; }
+      #btn-active   { background: #4fc3f7; color: #000; }
+      #btn-close    { background: #fc5c65; color: #fff; }
+      #btn-record   { background: #fc5c65; color: #fff; }
+      #btn-stoprec  { background: #f7c843; color: #000; }
+      #btn-download { background: #444;    color: #ccc; }
+
+      hr { border: none; border-top: 1px solid #222; margin: 12px 0; }
+
+      /* ── Error banner ───────────────────────────────────────── */
+      #error-banner {
+        display: none;
+        width: 100%; max-width: 800px;
+        background: #1e0000;
+        border: 1px solid #7c1a1a;
+        border-radius: 8px;
+        padding: 9px 14px;
+        color: #ff8080;
+        font-size: 0.8rem;
+      }
+
+      /* ── Video ──────────────────────────────────────────────── */
+      #video-wrap {
+        position: relative;
+        width: 100%; max-width: 800px;
+        background: #0a0a0a;
+        border-radius: 12px;
+        overflow: hidden;
+        aspect-ratio: 16/9;
+        border: 1px solid #272727;
+      }
+      video { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+      #placeholder {
+        position: absolute; inset: 0;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        gap: 10px;
+        color: #3a3a3a; font-size: 0.88rem;
+        background: #0a0a0a;
+      }
+      #placeholder svg { width: 50px; height: 50px; opacity: 0.18; }
+    </style>
+  </head>
+  <body>
+    <h1>🐱 HiSilver <span>— Mobile Simulator</span></h1>
+
+    <!-- ── Scenario Control ──────────────────────────────────── -->
+    <div class="card">
+      <div class="card-label">📱 Mobile Scenario</div>
+
+      <div class="state-row">
+        <div class="dot" id="state-dot"></div>
+        <span id="state-label">Idle</span>
+      </div>
+
+      <!-- Primary commands -->
+      <div class="btn-row">
+        <button id="btn-start">▶ Start</button>
+        <button id="btn-active"   disabled>📹 Active</button>
+        <button id="btn-close"    disabled>⏹ Close</button>
+      </div>
+
+      <hr />
+
+      <!-- Sub-commands -->
+      <div class="btn-row">
+        <button id="btn-record"   disabled>🔴 Record</button>
+        <button id="btn-stoprec"  disabled>⏹ Stop Record</button>
+        <button id="btn-download" disabled>☁ Download</button>
+      </div>
+    </div>
+
+    <!-- ── Error banner ──────────────────────────────────────── -->
+    <div id="error-banner"></div>
+
+    <!-- ── Camera stream ─────────────────────────────────────── -->
+    <div id="video-wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <div id="placeholder">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M15 10l4.553-2.276A1 1 0 0121 8.723v6.554a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"/>
+        </svg>
+        <span id="ph-text">Camera off — press Active to stream</span>
+      </div>
+    </div>
+
+    <script>
+      /* ── DOM refs ─────────────────────────────────────────────── */
+      const video       = document.getElementById('video');
+      const placeholder = document.getElementById('placeholder');
+      const phText      = document.getElementById('ph-text');
+      const stateDot    = document.getElementById('state-dot');
+      const stateLabel  = document.getElementById('state-label');
+      const errBanner   = document.getElementById('error-banner');
+      const btnStart    = document.getElementById('btn-start');
+      const btnActive   = document.getElementById('btn-active');
+      const btnClose    = document.getElementById('btn-close');
+      const btnRecord   = document.getElementById('btn-record');
+      const btnStoprec  = document.getElementById('btn-stoprec');
+      const btnDownload = document.getElementById('btn-download');
+
+      /* ── State ───────────────────────────────────────────────── */
+      let sessionId  = null;
+      let pc         = null;
+      let pollTimer  = null;
+      let hadRecord  = false;   // track if a recording was made
+
+      /* ── State machine ──────────────────────────────────────── */
+      // states: idle | started | streaming | recording
+      function setState(s, label) {
+        stateDot.className      = 'dot ' + s;
+        stateLabel.textContent  = label;
+        errBanner.style.display = 'none';
+
+        btnStart.disabled    = s !== 'idle';
+        btnActive.disabled   = s !== 'started';
+        btnClose.disabled    = s === 'idle';
+        btnRecord.disabled   = s !== 'streaming';
+        btnStoprec.disabled  = s !== 'recording';
+        btnDownload.disabled = !(hadRecord && (s === 'streaming' || s === 'recording'));
+      }
+
+      function showError(msg) {
+        errBanner.textContent  = '⚠  ' + msg;
+        errBanner.style.display = 'block';
+        console.error('[Simulator]', msg);
+      }
+
+      /* ── HTTP helper ────────────────────────────────────────── */
+      async function sendCmd(command, subCommand) {
+        const res = await fetch('/session/cmd', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({
+            command:    command    || '',
+            subCommand: subCommand || '',
+            sessionId:  sessionId  || '',
+          }),
+        });
+        if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+        return res.json();
+      }
+
+      /* ── WebRTC setup ───────────────────────────────────────── */
+      async function connectWebRTC(offer, sessId) {
+        if (pc) { pc.close(); pc = null; }
+        stopPoll();
+
+        pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+          ],
+        });
+
+        let streamAttached = false;
+        pc.ontrack = (evt) => {
+          if (!streamAttached && evt.streams && evt.streams[0]) {
+            streamAttached = true;
+            video.srcObject = evt.streams[0];
+            placeholder.style.display = 'none';
+            video.play().catch(e => console.warn('autoplay:', e));
+            setState('streaming', 'Streaming ✓');
+          }
+        };
+
+        pc.onicecandidate = (evt) => {
+          if (!evt.candidate) return;
+          fetch('/preview/ice-candidate', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ sessionId: sessId, candidate: evt.candidate }),
+          }).catch(e => console.warn('ICE send:', e));
+        };
+
+        pc.onconnectionstatechange = () => {
+          console.log('[WebRTC]', pc.connectionState);
+          if (pc.connectionState === 'connected') {
+            setState('streaming', 'Streaming ✓');
+            stopPoll();
+          } else if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+            stopPoll();
+            video.srcObject = null;
+            placeholder.style.display = 'flex';
+            phText.textContent = 'Connection lost';
+            setState('idle', 'Connection lost — press Start to retry');
+          }
+        };
+
+        await pc.setRemoteDescription({ type: 'offer', sdp: offer });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        const ansRes = await fetch('/preview/answer', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ sessionId: sessId, answer: answer.sdp }),
+        });
+        if (!ansRes.ok) throw new Error('Answer POST failed: ' + (await ansRes.text()));
+
+        startPoll(sessId);
+      }
+
+      function startPoll(sessId) {
+        let seen = 0;
+        pollTimer = setInterval(async () => {
+          if (!pc) { stopPoll(); return; }
+          try {
+            const res  = await fetch(`/preview/server-candidates?sessionId=${sessId}&offset=${seen}`);
+            const data = await res.json();
+            for (const c of (data.candidates || [])) {
+              await pc.addIceCandidate(c);
+              seen++;
+            }
+          } catch (e) { console.warn('poll:', e); }
+        }, 400);
+      }
+
+      function stopPoll() {
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      }
+
+      /* ── Button handlers ─────────────────────────────────────── */
+      btnStart.addEventListener('click', async () => {
+        setState('started', 'Session started — press Active to stream');
+        hadRecord = false;
+        try {
+          const data = await sendCmd('start');
+          sessionId  = data.sessionId;
+        } catch (e) {
+          showError('Start failed: ' + e.message);
+          setState('idle', 'Idle');
+        }
+      });
+
+      btnActive.addEventListener('click', async () => {
+        setState('started', 'Opening camera…');
+        try {
+          const data = await sendCmd('active');
+          sessionId  = data.sessionId;
+          await connectWebRTC(data.offer, data.sessionId);
+        } catch (e) {
+          showError('Active failed: ' + e.message);
+          setState('started', 'Error — try Active again');
+        }
+      });
+
+      btnClose.addEventListener('click', async () => {
+        stopPoll();
+        if (pc) { pc.close(); pc = null; }
+        video.srcObject = null;
+        placeholder.style.display = 'flex';
+        phText.textContent = 'Camera off — press Active to stream';
+        setState('idle', 'Idle — session closed');
+        try { await sendCmd('close'); } catch (e) { console.warn('close cmd:', e); }
+        sessionId = null;
+        hadRecord = false;
+      });
+
+      btnRecord.addEventListener('click', async () => {
+        try {
+          await sendCmd('', 'startRecord');
+          hadRecord = true;
+          setState('recording', 'Recording ●');
+        } catch (e) { showError('Record failed: ' + e.message); }
+      });
+
+      btnStoprec.addEventListener('click', async () => {
+        try {
+          await sendCmd('', 'stopRecord');
+          setState('streaming', 'Streaming ✓');
+        } catch (e) { showError('Stop record failed: ' + e.message); }
+      });
+
+      btnDownload.addEventListener('click', async () => {
+        try {
+          await sendCmd('', 'downloadRecord');
+        } catch (e) { showError('Download failed: ' + e.message); }
+      });
+
+      // Boot state
+      setState('idle', 'Idle — press Start to begin');
+    </script>
+  </body>
+</html>
     <style>
       *,
       *::before,

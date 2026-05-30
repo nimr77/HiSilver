@@ -44,6 +44,7 @@ func NewPreviewServer(manager *StreamManager) *PreviewServer {
 func (ps *PreviewServer) Start(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", ps.handleIndex)
+	mux.HandleFunc("/session/cmd", ps.handleSessionCmd)
 	mux.HandleFunc("/preview/offer", ps.handleOffer)
 	mux.HandleFunc("/preview/answer", ps.handleAnswer)
 	mux.HandleFunc("/preview/ice-candidate", ps.handleBrowserCandidate)
@@ -64,19 +65,16 @@ func (ps *PreviewServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(previewHTML)
 }
 
-// handleOffer creates a new PeerConnection with the live camera tracks, generates an
-// SDP offer, and returns it so the browser can call setRemoteDescription().
-func (ps *PreviewServer) handleOffer(w http.ResponseWriter, r *http.Request) {
+// createOffer builds a new preview PeerConnection, generates an SDP offer,
+// registers it in ps.sessions, and returns the SDP and session ID.
+func (ps *PreviewServer) createOffer() (sdp string, sessionID string, err error) {
 	pc, err := ps.manager.NewPreviewPeerConnection()
 	if err != nil {
-		http.Error(w, "failed to create peer connection: "+err.Error(), http.StatusInternalServerError)
-		log.Printf("❌ [Preview] NewPreviewPeerConnection: %v", err)
-		return
+		return "", "", fmt.Errorf("create peer connection: %w", err)
 	}
 
 	sess := &previewSession{pc: pc}
 
-	// Collect ICE candidates to serve back to the browser
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
@@ -101,26 +99,110 @@ func (ps *PreviewServer) handleOffer(w http.ResponseWriter, r *http.Request) {
 
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
-		http.Error(w, "create offer: "+err.Error(), http.StatusInternalServerError)
-		return
+		_ = pc.Close()
+		return "", "", fmt.Errorf("create offer: %w", err)
 	}
 	if err = pc.SetLocalDescription(offer); err != nil {
-		http.Error(w, "set local desc: "+err.Error(), http.StatusInternalServerError)
-		return
+		_ = pc.Close()
+		return "", "", fmt.Errorf("set local desc: %w", err)
 	}
 
-	// Generate a random session ID for this preview connection
-	sessionID := fmt.Sprintf("%d", rand.Int63())
-
+	sessionID = fmt.Sprintf("%d", rand.Int63())
 	ps.mu.Lock()
 	ps.sessions[sessionID] = sess
 	ps.mu.Unlock()
 
+	return offer.SDP, sessionID, nil
+}
+
+// closeAllSessions closes every active preview PeerConnection.
+func (ps *PreviewServer) closeAllSessions() {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	for id, sess := range ps.sessions {
+		_ = sess.pc.Close()
+		delete(ps.sessions, id)
+	}
+}
+
+// handleOffer creates a preview connection and returns the SDP offer to the browser.
+func (ps *PreviewServer) handleOffer(w http.ResponseWriter, r *http.Request) {
+	offer, sessionID, err := ps.createOffer()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("❌ [Preview] createOffer: %v", err)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"offer":     offer.SDP,
+		"offer":     offer,
 		"sessionId": sessionID,
 	})
+}
+
+// handleSessionCmd simulates mobile app commands so the browser can run the
+// full start → active → close scenario without a real Android device.
+func (ps *PreviewServer) handleSessionCmd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Command    string `json:"command"`
+		SubCommand string `json:"subCommand"`
+		SessionID  string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch body.Command {
+	case "start":
+		sid := fmt.Sprintf("%d", rand.Int63())
+		log.Printf("📱 [Simulator] start — new session %s", sid)
+		_ = json.NewEncoder(w).Encode(map[string]string{"sessionId": sid})
+		return
+
+	case "active":
+		log.Printf("📱 [Simulator] active — opening camera and streaming to browser")
+		ps.closeAllSessions() // drop any stale preview connection
+		offer, sid, err := ps.createOffer()
+		if err != nil {
+			http.Error(w, "stream setup failed: "+err.Error(), http.StatusInternalServerError)
+			log.Printf("❌ [Simulator] active: %v", err)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"offer":     offer,
+			"sessionId": sid,
+		})
+		return
+
+	case "close":
+		log.Printf("📱 [Simulator] close — stopping camera and all connections")
+		ps.closeAllSessions()
+		ps.manager.StopAll()
+		_ = json.NewEncoder(w).Encode(map[string]string{"ok": "1"})
+		return
+	}
+
+	switch body.SubCommand {
+	case "startRecord":
+		log.Printf("📱 [Simulator] startRecord")
+		ps.manager.ToggleRecording(true)
+	case "stopRecord":
+		log.Printf("📱 [Simulator] stopRecord")
+		ps.manager.ToggleRecording(false)
+	case "downloadRecord":
+		log.Printf("📱 [Simulator] downloadRecord — TODO: upload to Firebase Storage")
+	default:
+		http.Error(w, "unknown command or subCommand", http.StatusBadRequest)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]string{"ok": "1"})
 }
 
 // handleAnswer receives the browser's SDP answer and applies it to the PeerConnection.
