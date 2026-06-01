@@ -1,8 +1,8 @@
 package webrtc
 
 import (
-	_ "embed"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -312,9 +312,9 @@ func (ps *PreviewServer) handleMobileCandidate(w http.ResponseWriter, r *http.Re
 	var body struct {
 		SessionID string `json:"sessionId"`
 		Candidate struct {
-			Candidate        string  `json:"candidate"`
-			SDPMid           *string `json:"sdpMid"`
-			SDPMLineIndex    *uint16 `json:"sdpMLineIndex"`
+			Candidate     string  `json:"candidate"`
+			SDPMid        *string `json:"sdpMid"`
+			SDPMLineIndex *uint16 `json:"sdpMLineIndex"`
 		} `json:"candidate"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
